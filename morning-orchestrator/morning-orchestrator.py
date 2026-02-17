@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 
 # --- Config ---
 
-SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def get_accounts():
     """Get Gmail accounts from environment variable."""
     accounts_str = os.environ.get("GMAIL_ACCOUNTS", "")
@@ -80,8 +80,12 @@ def run_command(cmd: list[str], env: dict = None, timeout: int = 60) -> subproce
 
 
 def run_script(script_name: str, args: list[str] = None) -> dict | None:
-    """Run a sibling script and parse its JSON output."""
-    script_path = os.path.join(SCRIPTS_DIR, script_name)
+    """Run a sibling script and parse its JSON output.
+    script_name is the basename (e.g. 'gmail-promo-cleanup.py').
+    Scripts live in SCRIPTS_DIR/<stem>/<script_name>.
+    """
+    stem = script_name.replace(".py", "")
+    script_path = os.path.join(SCRIPTS_DIR, stem, script_name)
     cmd = [sys.executable, script_path] + (args or [])
     result = run_command(cmd, env=get_gog_env(), timeout=120)
     if result.returncode not in (0, 2):
