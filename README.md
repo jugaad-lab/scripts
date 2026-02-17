@@ -2,9 +2,13 @@
 
 Deterministic automation scripts for [OpenClaw](https://github.com/openclaw/openclaw) agents.
 
-## Philosophy: Scripts for Execution, Agents for Judgment
+## Philosophy: Don't Be a Telephone Operator
 
-If a deterministic script can do it, don't burn LLM tokens on it. Reserve your most expensive reasoning model for thinking that *requires* intelligence — strategy, pattern recognition, creative synthesis, pushing back.
+If you're paying for the most expensive reasoning model available, every token should go toward thinking that *requires* intelligence — strategy, accountability, pattern recognition, creative synthesis, pushing back. If a deterministic script can do it, it should.
+
+The telephone operator connected lines — valuable work, but you don't need an AI agent for it.
+
+**Scripts for execution, agents only for judgment.**
 
 **The pattern:** Run a $0 script first. Collect data, filter noise, check actionability. Only spawn an agent when there's actually something worth reasoning about.
 
