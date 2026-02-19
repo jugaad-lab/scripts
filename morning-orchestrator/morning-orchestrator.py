@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
 """
 Morning briefing orchestrator.
 Deterministic data collection layer — calls agent ONLY when actionable.
@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 
 # --- Config ---
@@ -74,9 +75,18 @@ NOISE_CATEGORIES = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
 
 # --- Helpers ---
 
-def run_command(cmd: list[str], env: dict = None, timeout: int = 60) -> subprocess.CompletedProcess:
-    """Run a command and return result."""
-    return subprocess.run(cmd, capture_output=True, text=True, env=env or os.environ, timeout=timeout)
+def run_command(cmd: list[str], env: dict = None, timeout: int = 60, retries: int = 3, backoff: float = 2.0) -> subprocess.CompletedProcess:
+    """Run a command with retries and exponential backoff."""
+    last_result = None
+    for attempt in range(retries):
+        last_result = subprocess.run(cmd, capture_output=True, text=True, env=env or os.environ, timeout=timeout)
+        if last_result.returncode == 0:
+            return last_result
+        if attempt < retries - 1:
+            wait = backoff * (2 ** attempt)
+            print(f"   ⚠️  Attempt {attempt + 1} failed (exit {last_result.returncode}), retrying in {wait:.0f}s...", file=sys.stderr)
+            time.sleep(wait)
+    return last_result
 
 
 def run_script(script_name: str, args: list[str] = None) -> dict | None:
@@ -282,14 +292,21 @@ def main():
     print(f"{'=' * 50}")
     print()
 
-    # Collect all data
+    # Collect all data — each collector is isolated so one failure doesn't kill the rest
+    def safe_collect(name, fn, fallback):
+        try:
+            return fn()
+        except Exception as e:
+            print(f"   ⚠️  {name} failed: {e}", file=sys.stderr)
+            return fallback
+
     data = {
         "timestamp": timestamp,
         "day": day_name,
-        "promos": collect_promo_cleanup(),
-        "discord": collect_discord_digest(hours=24),
-        "emails": collect_emails(),
-        "calendar": collect_calendar(),
+        "promos": safe_collect("promo cleanup", collect_promo_cleanup, {"total": 0, "accounts": {}}),
+        "discord": safe_collect("discord digest", lambda: collect_discord_digest(hours=24), {"total_messages": 0, "total_mentions": 0, "unanswered_mentions": [], "active_channels": []}),
+        "emails": safe_collect("email scan", collect_emails, {"total": 0, "important": [], "important_count": 0, "noise_count": 0}),
+        "calendar": safe_collect("calendar check", collect_calendar, {"events": [], "today_count": 0, "tomorrow_count": 0}),
     }
 
     print()
