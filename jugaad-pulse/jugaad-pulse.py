@@ -27,7 +27,12 @@ STALE_DAYS = int(os.environ.get("PULSE_STALE_DAYS", "3"))
 
 
 def gh_api(endpoint: str) -> list | dict | None:
-    """Call GitHub API via gh CLI."""
+    """Call GitHub API via gh CLI.
+
+    Handles NDJSON from --paginate: when multiple pages are returned,
+    gh concatenates JSON arrays as separate objects. We parse each line
+    and merge arrays into a single list.
+    """
     result = subprocess.run(
         ["gh", "api", endpoint, "--paginate"],
         capture_output=True, text=True, timeout=30,
@@ -35,10 +40,35 @@ def gh_api(endpoint: str) -> list | dict | None:
     if result.returncode != 0:
         print(f"  ⚠️ gh api {endpoint} failed: {result.stderr[:200]}", file=sys.stderr)
         return None
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
+    stdout = result.stdout.strip()
+    if not stdout:
         return None
+    # Try single JSON parse first (common case: single page)
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+    # Handle NDJSON: multiple JSON arrays/objects concatenated
+    merged = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(stdout):
+        # Skip whitespace
+        while pos < len(stdout) and stdout[pos] in ' \t\n\r':
+            pos += 1
+        if pos >= len(stdout):
+            break
+        try:
+            obj, end = decoder.raw_decode(stdout, pos)
+            if isinstance(obj, list):
+                merged.extend(obj)
+            else:
+                merged.append(obj)
+            pos = end
+        except json.JSONDecodeError:
+            print(f"  ⚠️ gh api {endpoint}: NDJSON parse error at pos {pos}", file=sys.stderr)
+            return merged if merged else None
+    return merged if merged else None
 
 
 def get_repos() -> list[str]:
@@ -82,9 +112,12 @@ def get_review_state(repo: str, pr_number: int) -> str:
     return "pending"
 
 
-def get_open_prs(repo: str) -> list[dict]:
-    """Get open PRs for a repo, enriched with review state and activity info."""
+def get_open_prs(repo: str) -> list[dict] | None:
+    """Get open PRs for a repo, enriched with review state and activity info.
+    Returns None on API failure, empty list if no PRs."""
     prs = gh_api(f"/repos/{ORG}/{repo}/pulls?state=open&per_page=50")
+    if prs is None:
+        return None
     if not prs:
         return []
     now = datetime.now(timezone.utc)
@@ -115,9 +148,11 @@ def get_open_prs(repo: str) -> list[dict]:
     return results
 
 
-def get_open_issues(repo: str) -> list[dict]:
-    """Get open issues (not PRs) for a repo."""
+def get_open_issues(repo: str) -> list[dict] | None:
+    """Get open issues (not PRs) for a repo. Returns None on API failure."""
     issues = gh_api(f"/repos/{ORG}/{repo}/issues?state=open&per_page=50")
+    if issues is None:
+        return None
     if not issues:
         return []
     now = datetime.now(timezone.utc)
@@ -161,9 +196,10 @@ def print_discord_summary(summary: dict) -> None:
         if p["stale"] and p["review_state"] == "changes_requested"
     ]
     # Also include stale PRs authored by known bots (our bots' work going stale)
+    attention_keys = {(p["repo"], p["number"]) for p in needs_attention}
     stale_bot_prs = [
         p for p in summary["all_prs"]
-        if p["stale"] and p["is_bot"] and p not in needs_attention
+        if p["stale"] and p["is_bot"] and (p["repo"], p["number"]) not in attention_keys
     ]
     # Stale issues
     stale_issues = [i for i in summary["all_issues"] if i["stale"]]
@@ -211,6 +247,12 @@ def print_discord_summary(summary: dict) -> None:
     if not has_anything:
         lines.append("✅ **All Clear**")
 
+    if summary.get("scan_errors"):
+        lines.append("")
+        lines.append(f"⚠️ **Scan errors** ({len(summary['scan_errors'])} endpoints failed):")
+        for err in summary["scan_errors"][:5]:
+            lines.append(f"  - {err}")
+
     print("\n".join(lines))
 
 
@@ -243,14 +285,19 @@ def main():
 
     all_prs = []
     all_issues = []
+    scan_errors = []
 
     for repo in repos:
         prs = get_open_prs(repo)
         issues = get_open_issues(repo)
-        for pr in prs:
+        if prs is None:
+            scan_errors.append(f"{repo}/pulls")
+        if issues is None:
+            scan_errors.append(f"{repo}/issues")
+        for pr in (prs or []):
             pr["repo"] = repo
             all_prs.append(pr)
-        for issue in issues:
+        for issue in (issues or []):
             issue["repo"] = repo
             all_issues.append(issue)
 
@@ -263,6 +310,7 @@ def main():
 
     summary = {
         "timestamp": datetime.now().isoformat(),
+        "scan_errors": scan_errors,
         "repos_scanned": len(repos),
         "total_open_prs": len(all_prs),
         "total_open_issues": len(all_issues),
