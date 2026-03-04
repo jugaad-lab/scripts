@@ -166,6 +166,186 @@ class TestAccounts:
                 orch.get_calendar_account()
 
 
+class TestBlogPipeline:
+    """Test blog pipeline file check."""
+
+    def test_no_pipeline_file(self, tmp_path):
+        """Returns exists=False when file doesn't exist."""
+        original = orch.WORKSPACE_DIR
+        orch.WORKSPACE_DIR = str(tmp_path)
+        try:
+            result = orch.collect_blog_pipeline()
+            assert result["exists"] is False
+        finally:
+            orch.WORKSPACE_DIR = original
+
+    def test_parses_active_blogs(self, tmp_path):
+        """Correctly identifies active blogs (not SHIPPED, not SEED)."""
+        pipeline = tmp_path / "blog-pipeline.md"
+        pipeline.write_text(
+            '## Blog 1: "Architecture of Belief"\n'
+            '- **Stage:** SHIPPED ✅\n'
+            '\n'
+            '## Blog 2: "On Conviction"\n'
+            '- **Stage:** OUTLINE COMPLETE ✅ → Next: Marinate → Draft\n'
+            '\n'
+            '## Blog 3: "Unfalsifiable Systems"\n'
+            '- **Stage:** IDEA CAPTURED → Needs marinate + outline\n'
+            '\n'
+            '## Blog 4+: The Personal Journey\n'
+            '- **Stage:** SEED\n'
+        )
+        original = orch.WORKSPACE_DIR
+        orch.WORKSPACE_DIR = str(tmp_path)
+        try:
+            result = orch.collect_blog_pipeline()
+            assert result["exists"] is True
+            assert len(result["active_blogs"]) == 2
+            titles = [b["title"] for b in result["active_blogs"]]
+            assert any("Conviction" in t for t in titles)
+            assert any("Unfalsifiable" in t for t in titles)
+        finally:
+            orch.WORKSPACE_DIR = original
+
+    def test_days_since_modified(self, tmp_path):
+        """Reports modification time correctly."""
+        pipeline = tmp_path / "blog-pipeline.md"
+        pipeline.write_text("## Blog 1: Test\n- **Stage:** SHIPPED\n")
+        original = orch.WORKSPACE_DIR
+        orch.WORKSPACE_DIR = str(tmp_path)
+        try:
+            result = orch.collect_blog_pipeline()
+            assert result["days_since_modified"] < 1  # just created
+        finally:
+            orch.WORKSPACE_DIR = original
+
+
+class TestTodos:
+    """Test todos file check."""
+
+    def test_no_todos_file(self, tmp_path):
+        """Returns exists=False when file doesn't exist."""
+        original = orch.WORKSPACE_DIR
+        orch.WORKSPACE_DIR = str(tmp_path)
+        try:
+            result = orch.collect_todos()
+            assert result["exists"] is False
+            assert result["pending_count"] == 0
+        finally:
+            orch.WORKSPACE_DIR = original
+
+    def test_parses_pending_items(self, tmp_path):
+        """Correctly counts pending items."""
+        todos = tmp_path / "todos.md"
+        todos.write_text(
+            "# Bunny's TODOs\n\n"
+            "## Pending\n\n"
+            "### Cost tracking setup\n"
+            "- Details here\n\n"
+            "### Fix the widget\n"
+            "- More details\n\n"
+            "## Done\n\n"
+            "### Already done thing ✅\n"
+        )
+        original = orch.WORKSPACE_DIR
+        orch.WORKSPACE_DIR = str(tmp_path)
+        try:
+            result = orch.collect_todos()
+            assert result["exists"] is True
+            assert result["pending_count"] == 2
+            assert "Cost tracking setup" in result["pending_items"]
+            assert "Fix the widget" in result["pending_items"]
+        finally:
+            orch.WORKSPACE_DIR = original
+
+    def test_empty_pending_section(self, tmp_path):
+        """Returns 0 when pending section is empty."""
+        todos = tmp_path / "todos.md"
+        todos.write_text(
+            "# Bunny's TODOs\n\n"
+            "## Pending\n\n"
+            "## Done\n\n"
+            "### All done ✅\n"
+        )
+        original = orch.WORKSPACE_DIR
+        orch.WORKSPACE_DIR = str(tmp_path)
+        try:
+            result = orch.collect_todos()
+            assert result["pending_count"] == 0
+        finally:
+            orch.WORKSPACE_DIR = original
+
+
+class TestActionabilityWithNewCollectors:
+    """Test actionability triggers for blog pipeline and todos."""
+
+    def test_stale_blog_triggers(self):
+        """Blog untouched for 7+ days should trigger."""
+        data = {
+            "emails": {"important_count": 0},
+            "calendar": {"today_count": 0},
+            "discord": {"unanswered_mentions": []},
+            "blog_pipeline": {"active_blogs": [{"title": "Test", "stage": "DRAFT"}], "days_since_modified": 8.0},
+            "todos": {"pending_count": 0},
+        }
+        # Patch to weekend so weekday doesn't trigger
+        old_datetime = orch.datetime
+        class FakeSunday(datetime):
+            @classmethod
+            def now(cls, *args, **kwargs):
+                return datetime(2026, 3, 1)  # Sunday
+        orch.datetime = FakeSunday
+        try:
+            actionable, reasons = orch.is_actionable(data)
+            assert actionable
+            assert any("blog" in r for r in reasons)
+        finally:
+            orch.datetime = old_datetime
+
+    def test_fresh_blog_no_trigger(self):
+        """Blog touched recently should NOT trigger."""
+        data = {
+            "emails": {"important_count": 0},
+            "calendar": {"today_count": 0},
+            "discord": {"unanswered_mentions": []},
+            "blog_pipeline": {"active_blogs": [{"title": "Test", "stage": "DRAFT"}], "days_since_modified": 2.0},
+            "todos": {"pending_count": 0},
+        }
+        old_datetime = orch.datetime
+        class FakeSunday(datetime):
+            @classmethod
+            def now(cls, *args, **kwargs):
+                return datetime(2026, 3, 1)
+        orch.datetime = FakeSunday
+        try:
+            actionable, reasons = orch.is_actionable(data)
+            assert not any("blog" in r for r in reasons)
+        finally:
+            orch.datetime = old_datetime
+
+    def test_pending_todos_trigger(self):
+        """Pending todos should trigger."""
+        data = {
+            "emails": {"important_count": 0},
+            "calendar": {"today_count": 0},
+            "discord": {"unanswered_mentions": []},
+            "blog_pipeline": {"exists": False},
+            "todos": {"pending_count": 2},
+        }
+        old_datetime = orch.datetime
+        class FakeSunday(datetime):
+            @classmethod
+            def now(cls, *args, **kwargs):
+                return datetime(2026, 3, 1)
+        orch.datetime = FakeSunday
+        try:
+            actionable, reasons = orch.is_actionable(data)
+            assert actionable
+            assert any("todo" in r for r in reasons)
+        finally:
+            orch.datetime = old_datetime
+
+
 class TestIntegration:
     """Integration test — full dry-run."""
 
