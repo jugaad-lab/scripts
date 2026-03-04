@@ -35,8 +35,12 @@ TRANSCRIPT_DIRS = [
 MAX_5X_MONTHLY = 100.0   # $100/mo
 MAX_20X_MONTHLY = 200.0  # $200/mo
 
-# Buffer: recommend switch only if API cost exceeds plan by this margin
-SWITCH_THRESHOLD = 0.8  # recommend at 80% of plan cost (to account for rate limit value)
+# Current plan — change this if you switch plans
+CURRENT_PLAN = "MAX_20X"  # Options: "API", "MAX_5X", "MAX_20X"
+
+# Downgrade buffer: only recommend downgrade if savings exceed this % of current plan
+# (accounts for rate limit value, burst headroom, etc.)
+DOWNGRADE_MARGIN = 0.3  # recommend downgrade only if projected cost is <70% of current plan
 
 
 # --- Core ---
@@ -156,13 +160,42 @@ def analyze(entries: list[dict], days: int) -> dict:
         trend = "insufficient_data"
         trend_pct = 0
 
-    # Max plan comparison
-    if monthly_projection >= MAX_20X_MONTHLY * SWITCH_THRESHOLD:
-        recommendation = "CONSIDER_MAX_20X"
-    elif monthly_projection >= MAX_5X_MONTHLY * SWITCH_THRESHOLD:
-        recommendation = "CONSIDER_MAX_5X"
-    else:
-        recommendation = "STAY_API"
+    # Plan recommendation — based on CURRENT_PLAN, advise if downgrade makes sense
+    # or if usage exceeds what the plan covers (burning API credits on top)
+    plan_costs = {"API": 0, "MAX_5X": MAX_5X_MONTHLY, "MAX_20X": MAX_20X_MONTHLY}
+    current_plan_cost = plan_costs.get(CURRENT_PLAN, MAX_20X_MONTHLY)
+    downgrade_threshold = current_plan_cost * (1 - DOWNGRADE_MARGIN)
+
+    if CURRENT_PLAN == "MAX_20X":
+        if monthly_projection < MAX_5X_MONTHLY * (1 - DOWNGRADE_MARGIN):
+            recommendation = "DOWNGRADE_TO_API"
+            potential_savings = round(MAX_20X_MONTHLY - monthly_projection, 2)
+        elif monthly_projection < downgrade_threshold:
+            recommendation = "DOWNGRADE_TO_MAX_5X"
+            potential_savings = round(MAX_20X_MONTHLY - MAX_5X_MONTHLY, 2)
+        else:
+            recommendation = "STAY_MAX_20X"
+            potential_savings = 0
+    elif CURRENT_PLAN == "MAX_5X":
+        if monthly_projection < MAX_5X_MONTHLY * (1 - DOWNGRADE_MARGIN):
+            recommendation = "DOWNGRADE_TO_API"
+            potential_savings = round(MAX_5X_MONTHLY - monthly_projection, 2)
+        elif monthly_projection >= MAX_20X_MONTHLY * DOWNGRADE_MARGIN:
+            recommendation = "UPGRADE_TO_MAX_20X"
+            potential_savings = round(monthly_projection - MAX_20X_MONTHLY, 2)
+        else:
+            recommendation = "STAY_MAX_5X"
+            potential_savings = 0
+    else:  # API
+        if monthly_projection >= MAX_20X_MONTHLY * DOWNGRADE_MARGIN:
+            recommendation = "UPGRADE_TO_MAX_20X"
+            potential_savings = round(monthly_projection - MAX_20X_MONTHLY, 2)
+        elif monthly_projection >= MAX_5X_MONTHLY * DOWNGRADE_MARGIN:
+            recommendation = "UPGRADE_TO_MAX_5X"
+            potential_savings = round(monthly_projection - MAX_5X_MONTHLY, 2)
+        else:
+            recommendation = "STAY_API"
+            potential_savings = 0
 
     # Model breakdown
     model_breakdown = []
@@ -183,9 +216,10 @@ def analyze(entries: list[dict], days: int) -> dict:
         "monthly_projection": round(monthly_projection, 2),
         "trend": trend,
         "trend_pct": round(trend_pct, 1),
+        "current_plan": CURRENT_PLAN,
+        "current_plan_cost": current_plan_cost,
         "recommendation": recommendation,
-        "max_5x_savings": round(monthly_projection - MAX_5X_MONTHLY, 2) if monthly_projection > MAX_5X_MONTHLY else 0,
-        "max_20x_savings": round(monthly_projection - MAX_20X_MONTHLY, 2) if monthly_projection > MAX_20X_MONTHLY else 0,
+        "potential_savings": potential_savings,
         "daily_costs": daily_costs,
         "model_breakdown": model_breakdown,
         "total_calls": len(entries),
