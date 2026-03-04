@@ -385,10 +385,12 @@ def is_actionable(data: dict) -> tuple[bool, list[str]]:
     if unanswered > 0:
         reasons.append(f"{unanswered} unanswered Discord mentions")
 
-    # Cost tracker — flag if recommendation changed to consider switching
+    # Cost tracker — only flag if there's an actionable plan change recommendation
     costs = data.get("costs", {})
-    if costs.get("recommendation") in ("CONSIDER_MAX_5X", "CONSIDER_MAX_20X"):
-        reasons.append(f"API costs: ${costs.get('monthly_projection', '?')}/mo projected → {costs['recommendation']}")
+    rec = costs.get("recommendation", "")
+    if rec.startswith("DOWNGRADE_") or rec.startswith("UPGRADE_"):
+        savings = costs.get("potential_savings", 0)
+        reasons.append(f"API costs: ${costs.get('monthly_projection', '?')}/mo projected → {rec} (save ~${savings}/mo)")
 
     # Blog pipeline — only flag if active blog hasn't been touched in 7+ days
     blog = data.get("blog_pipeline", {})

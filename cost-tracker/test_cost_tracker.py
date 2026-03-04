@@ -121,11 +121,12 @@ class TestAnalyze:
             for i in range(30)
         ]
         result = ct.analyze(entries, 30)
-        # $1/day = $30/mo projection → STAY_API
-        assert result["recommendation"] == "STAY_API"
+        # $1/day = $30/mo → on Max 20x, should recommend downgrading to API
+        assert result["recommendation"] == "DOWNGRADE_TO_API"
+        assert result["current_plan"] == "MAX_20X"
 
-    def test_recommendation_consider_max_5x(self):
-        """$3-4/day should recommend considering Max 5x."""
+    def test_recommendation_downgrade_to_max_5x(self):
+        """$3-4/day should recommend downgrading to Max 5x (from Max 20x)."""
         entries = [
             {"date": (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d"),
              "model": "test", "cost_total": 3.5,
@@ -134,11 +135,11 @@ class TestAnalyze:
             for i in range(30)
         ]
         result = ct.analyze(entries, 30)
-        # $3.5/day = $105/mo projection → CONSIDER_MAX_5X
-        assert result["recommendation"] == "CONSIDER_MAX_5X"
+        # $3.5/day = $105/mo → below 70% of Max 20x ($140), suggest downgrade to Max 5x
+        assert result["recommendation"] == "DOWNGRADE_TO_MAX_5X"
 
-    def test_recommendation_consider_max_20x(self):
-        """$7+/day should recommend considering Max 20x."""
+    def test_recommendation_stay_max_20x(self):
+        """$7+/day should stay on Max 20x."""
         entries = [
             {"date": (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d"),
              "model": "test", "cost_total": 7.0,
@@ -147,8 +148,8 @@ class TestAnalyze:
             for i in range(30)
         ]
         result = ct.analyze(entries, 30)
-        # $7/day = $210/mo projection → CONSIDER_MAX_20X
-        assert result["recommendation"] == "CONSIDER_MAX_20X"
+        # $7/day = $210/mo → above threshold, stay on Max 20x
+        assert result["recommendation"] == "STAY_MAX_20X"
 
     def test_model_breakdown_sorted_by_cost(self):
         """Model breakdown should be sorted by cost descending."""
