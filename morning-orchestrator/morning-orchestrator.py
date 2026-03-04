@@ -250,6 +250,122 @@ def collect_calendar() -> dict:
     }
 
 
+# --- Workspace File Checks (zero-cost, filesystem only) ---
+
+WORKSPACE_DIR = os.path.join(os.path.dirname(SCRIPTS_DIR), "memory")
+
+def collect_cost_tracker() -> dict:
+    """Run cost tracker and return results. Filesystem only, zero API calls."""
+    print("💰 Checking API costs...")
+    cost_file = "/tmp/cost-tracker.json"
+
+    # Run the cost tracker script
+    cost_script = os.path.join(SCRIPTS_DIR, "cost-tracker", "cost-tracker.py")
+    if not os.path.exists(cost_script):
+        print("   Cost tracker script not found")
+        return {"exists": False}
+
+    result = subprocess.run(
+        [sys.executable, cost_script, "--out", cost_file, "--days", "30"],
+        capture_output=True, text=True, timeout=60
+    )
+
+    if result.returncode not in (0, 2):
+        print(f"   ⚠️  Cost tracker failed: {result.stderr[:200]}", file=sys.stderr)
+        return {"exists": False}
+
+    if result.returncode == 2:
+        print("   No cost data found")
+        return {"exists": True, "has_data": False}
+
+    try:
+        with open(cost_file) as f:
+            data = json.load(f)
+        # Only pass summary to agent, not full daily breakdown
+        summary = {
+            "exists": True,
+            "has_data": data.get("has_data", False),
+            "total_cost": data.get("total_cost"),
+            "daily_average": data.get("daily_average"),
+            "monthly_projection": data.get("monthly_projection"),
+            "trend": data.get("trend"),
+            "recommendation": data.get("recommendation"),
+            "model_breakdown": data.get("model_breakdown", [])[:3],  # top 3 models only
+        }
+        print(f"   ${data.get('daily_average', 0)}/day avg, ${data.get('monthly_projection', 0)}/mo projected → {data.get('recommendation', 'N/A')}")
+        return summary
+    except (json.JSONDecodeError, IOError):
+        return {"exists": False}
+
+
+def collect_blog_pipeline() -> dict:
+    """Check blog pipeline status from file metadata + content. Zero API calls."""
+    print("📝 Checking blog pipeline...")
+    pipeline_path = os.path.join(WORKSPACE_DIR, "blog-pipeline.md")
+
+    if not os.path.exists(pipeline_path):
+        print("   No pipeline file found")
+        return {"exists": False}
+
+    mtime = os.path.getmtime(pipeline_path)
+    days_since_modified = (time.time() - mtime) / 86400
+
+    # Parse active blogs (lines matching "Stage:" that aren't SHIPPED or SEED)
+    active_blogs = []
+    current_blog = None
+    with open(pipeline_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("## Blog") and ":" in line:
+                current_blog = line.split(":", 1)[1].strip().strip('"')
+            if "**Stage:**" in line and current_blog:
+                stage = line.split("**Stage:**")[1].strip()
+                if "SHIPPED" not in stage and "SEED" not in stage:
+                    active_blogs.append({"title": current_blog, "stage": stage})
+                current_blog = None
+
+    result = {
+        "exists": True,
+        "days_since_modified": round(days_since_modified, 1),
+        "active_blogs": active_blogs,
+    }
+    print(f"   {len(active_blogs)} active blog(s), last modified {days_since_modified:.0f}d ago")
+    return result
+
+
+def collect_todos() -> dict:
+    """Check todos file for pending items. Zero API calls."""
+    print("✅ Checking todos...")
+    todos_path = os.path.join(WORKSPACE_DIR, "todos.md")
+
+    if not os.path.exists(todos_path):
+        print("   No todos file found")
+        return {"exists": False, "pending_count": 0}
+
+    pending = []
+    in_pending = False
+    current_item = None
+    with open(todos_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line == "## Pending":
+                in_pending = True
+                continue
+            if line.startswith("## ") and in_pending:
+                break  # hit next section
+            if in_pending and line.startswith("### "):
+                current_item = line[4:].strip()
+                pending.append(current_item)
+
+    result = {
+        "exists": True,
+        "pending_count": len(pending),
+        "pending_items": pending,
+    }
+    print(f"   {len(pending)} pending todo(s)")
+    return result
+
+
 # --- Actionability Check ---
 
 def is_actionable(data: dict) -> tuple[bool, list[str]]:
@@ -268,6 +384,21 @@ def is_actionable(data: dict) -> tuple[bool, list[str]]:
     unanswered = len(data["discord"].get("unanswered_mentions", []))
     if unanswered > 0:
         reasons.append(f"{unanswered} unanswered Discord mentions")
+
+    # Cost tracker — flag if recommendation changed to consider switching
+    costs = data.get("costs", {})
+    if costs.get("recommendation") in ("CONSIDER_MAX_5X", "CONSIDER_MAX_20X"):
+        reasons.append(f"API costs: ${costs.get('monthly_projection', '?')}/mo projected → {costs['recommendation']}")
+
+    # Blog pipeline — only flag if active blog hasn't been touched in 7+ days
+    blog = data.get("blog_pipeline", {})
+    if blog.get("active_blogs") and blog.get("days_since_modified", 0) >= 7:
+        reasons.append(f"blog pipeline untouched for {blog['days_since_modified']:.0f} days")
+
+    # Pending todos
+    todos = data.get("todos", {})
+    if todos.get("pending_count", 0) > 0:
+        reasons.append(f"{todos['pending_count']} pending todo(s)")
 
     # Weekday check — always actionable on weekdays (work priorities matter)
     day_of_week = datetime.now().weekday()  # 0=Monday, 6=Sunday
@@ -307,6 +438,9 @@ def main():
         "discord": safe_collect("discord digest", lambda: collect_discord_digest(hours=24), {"total_messages": 0, "total_mentions": 0, "unanswered_mentions": [], "active_channels": []}),
         "emails": safe_collect("email scan", collect_emails, {"total": 0, "important": [], "important_count": 0, "noise_count": 0}),
         "calendar": safe_collect("calendar check", collect_calendar, {"events": [], "today_count": 0, "tomorrow_count": 0}),
+        "blog_pipeline": safe_collect("blog pipeline", collect_blog_pipeline, {"exists": False}),
+        "todos": safe_collect("todos", collect_todos, {"exists": False, "pending_count": 0}),
+        "costs": safe_collect("cost tracker", collect_cost_tracker, {"exists": False}),
     }
 
     print()
