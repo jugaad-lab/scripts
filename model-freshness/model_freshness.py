@@ -5,25 +5,42 @@ import argparse, json, re, sys, urllib.request
 from pathlib import Path
 
 MODELS_URL = "https://docs.anthropic.com/en/docs/about-claude/models"
-DEFAULT_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
+# Support both current (~/.openclaw/) and legacy (~/.clawdbot/) config paths
+CONFIG_PATHS = [Path.home() / ".openclaw" / "openclaw.json",
+                Path.home() / ".clawdbot" / "openclaw.json"]
 
 FAMILIES = ["opus", "sonnet", "haiku"]
 
 
+def find_default_config():
+    """Find the first existing config path."""
+    for p in CONFIG_PATHS:
+        if p.exists():
+            return p
+    return CONFIG_PATHS[0]  # fall back to primary path for error messaging
+
+
 def fetch_latest_models():
-    """Scrape Anthropic docs for latest model API aliases from the first table."""
-    req = urllib.request.Request(MODELS_URL, headers={"User-Agent": "ModelFreshness/1.0"})
-    html = urllib.request.urlopen(req, timeout=15).read().decode()
+    """Scrape Anthropic docs for latest model versions.
+    
+    NOTE: This is inherently brittle — depends on Anthropic's HTML structure.
+    If it breaks (returns empty dict), update the regex patterns below.
+    """
+    try:
+        req = urllib.request.Request(MODELS_URL, headers={"User-Agent": "ModelFreshness/1.0"})
+        html = urllib.request.urlopen(req, timeout=15).read().decode()
+    except Exception as e:
+        print(f"ERROR: Failed to fetch Anthropic docs: {e}", file=sys.stderr)
+        sys.exit(2)
     latest = {}
-    # Find "API alias" row entries — these are the canonical latest aliases
-    # Also check for "API ID" entries as fallback
     for family in FAMILIES:
-        # Look for alias first (e.g. claude-opus-4-6), then ID
         pat = re.compile(rf"claude-{family}-[\d.]+-[\d]+|claude-{family}-[\d.]+")
         matches = pat.findall(html)
         if matches:
-            # First occurrence on the page is from the "Latest models" table
             latest[family] = matches[0]
+    if not latest:
+        print("ERROR: Scraped 0 models from Anthropic docs — page structure may have changed.", file=sys.stderr)
+        sys.exit(2)
     return latest
 
 
@@ -74,10 +91,14 @@ def format_discord(results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Check OpenClaw model freshness against Anthropic docs")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to openclaw.json")
+    parser.add_argument("--config", default=None, help="Path to openclaw.json (auto-detects if not set)")
     parser.add_argument("--discord", action="store_true", help="Format output for Discord")
     args = parser.parse_args()
 
-    results = check_freshness(args.config)
+    config_path = args.config or str(find_default_config())
+    if not Path(config_path).exists():
+        print(f"ERROR: Config not found at {config_path}", file=sys.stderr)
+        sys.exit(2)
+    results = check_freshness(config_path)
     print(format_discord(results) if args.discord else format_plain(results))
     sys.exit(1 if any(r["stale"] for r in results) else 0)
