@@ -301,6 +301,13 @@ def extract_task_chains(messages):
                 "assistant_tokens": current_assistant_tokens,
             })
 
+    # Session-level brain context check: startup hook_success entries arrive before the
+    # first user message so chain-scoped checks miss them. If brain signals appear anywhere
+    # in the session, all chains inherit brain_used=True.
+    if chains and has_brain_context(messages, 0, len(messages)):
+        for chain in chains:
+            chain["brain_used"] = True
+
     return chains
 
 
@@ -522,8 +529,13 @@ def load_from_jsonl(jsonl_path):
             elif entry_type in ("user", "assistant"):
                 msg = entry.get("message", {})
                 role = msg.get("role") or entry_type
+            elif entry_type == "attachment" and entry.get("attachment", {}).get("type") == "hook_success":
+                # Hook success entries (e.g. startup brain context) have content in attachment.content
+                attachment = entry.get("attachment", {})
+                msg = {"role": "user", "content": attachment.get("content", "")}
+                role = "user"
             elif entry_type == "attachment" and entry.get("message"):
-                # Hook results (e.g. startup brain context) land here
+                # Other attachment entries with a message field
                 msg = entry.get("message", {})
                 role = msg.get("role", "user")
             else:
