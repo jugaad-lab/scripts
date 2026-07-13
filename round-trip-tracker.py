@@ -27,6 +27,26 @@ from collections import defaultdict
 TRACKING_LOG = Path(__file__).parent.parent / "cashew" / "data" / "round-trip-log.jsonl"
 REPORT_LAST_N = 50
 
+# Fallback source for the model tag when a session's JSONL entries don't carry a
+# per-message "model" field (e.g. older OpenClaw-format transcripts). switch-model.sh
+# writes the live default here on every model change.
+BRIDGE_MODEL_FILE = Path.home() / "bunny-claude-bridge" / "current-model.txt"
+
+
+def fallback_model():
+    """Best-effort model tag when the transcript itself doesn't say which model ran.
+    Checked in order: CASHEW_CLAUDE_MODEL / CLAUDE_MODEL env vars, then the bridge's
+    current-model.txt (written by switch-model.sh)."""
+    import os
+    for var in ("CASHEW_CLAUDE_MODEL", "CLAUDE_MODEL"):
+        val = os.environ.get(var)
+        if val:
+            return val
+    try:
+        return BRIDGE_MODEL_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
 # Signals that brain context was pulled (updated for toolCall structure)
 BRAIN_SIGNALS = [
     "cashew_context.py context",
@@ -43,6 +63,33 @@ CLARIFICATION_SIGNALS = [
     "could you specify", "are you referring", "want me to", "should i",
     "did you mean", "are you talking about",
 ]
+
+# The user pushing back on / correcting the previous task is a DIFFICULTY-AGNOSTIC
+# quality miss: a task the user had to correct wasn't done right, no matter how
+# many exchanges it took. This is the signal first_try_success (exchanges==1)
+# should have been — it conflated task complexity with quality.
+CORRECTION_SIGNALS = [
+    "that's wrong", "thats wrong", "that's not right", "that's incorrect", "incorrect",
+    "not what i", "that's not what", "you missed", "you forgot", "didn't work",
+    "did not work", "still broken", "still failing", "that broke", "try again",
+    "redo", "do it again", "that's not it", "not quite", "actually no", "undo",
+    "revert that", "that isn't right", "isn't right",
+]
+CORRECTION_OPENERS = ("no ", "no,", "nope", "not ", "wrong", "actually,")
+
+
+def is_correction(content):
+    """Heuristic: does this message push back on / correct the previous task?
+    A short message opening with a negation counts; so does any explicit pushback
+    phrase. Used as the difficulty-agnostic quality signal."""
+    c = (content or "").strip().lower()
+    if not c:
+        return False
+    if any(sig in c for sig in CORRECTION_SIGNALS):
+        return True
+    if len(c) < 80 and c.startswith(CORRECTION_OPENERS):
+        return True
+    return False
 
 
 def extract_text(content):
@@ -218,6 +265,7 @@ def extract_task_chains(messages):
     current_timestamp = ""
     current_user_tokens = 0
     current_assistant_tokens = 0
+    current_model = None
     chain_start_idx = 0
 
     for i, msg in enumerate(messages):
@@ -244,13 +292,17 @@ def extract_task_chains(messages):
                         "brain_used": has_brain_context(messages, chain_start_idx, i),
                         "clarifications_needed": current_clarifications,
                         "first_try_success": current_exchanges == 1 and current_clarifications == 0,
+                        # user_text is the NEXT request that closed this chain — if it's a
+                        # pushback, the just-finished task needed correcting.
+                        "correction_signaled": is_correction(user_text),
                         "timestamp": current_timestamp,
                         "tokens_estimate": total_tokens,
                         "tokens_per_exchange": tpe,
                         "user_tokens": current_user_tokens,
                         "assistant_tokens": current_assistant_tokens,
+                        "session_model": current_model or fallback_model(),
                     })
-            
+
             # Start new chain
             current_chain_start = i
             chain_start_idx = i
@@ -258,6 +310,7 @@ def extract_task_chains(messages):
             current_clarifications = 0
             current_user_tokens = 0
             current_assistant_tokens = 0
+            current_model = None
             current_task = user_text
             current_timestamp = msg.get("timestamp", datetime.now(timezone.utc).isoformat())
             current_user_tokens += estimate_tokens(user_text)
@@ -271,6 +324,8 @@ def extract_task_chains(messages):
             
             current_exchanges += 1
             current_assistant_tokens += estimate_tokens(assistant_text)
+            if msg.get("model"):
+                current_model = msg["model"]
             content_lower = assistant_text.lower()
             if any(sig in content_lower for sig in CLARIFICATION_SIGNALS):
                 current_clarifications += 1
@@ -294,11 +349,13 @@ def extract_task_chains(messages):
                 "brain_used": has_brain_context(messages, chain_start_idx, len(messages)),
                 "clarifications_needed": current_clarifications,
                 "first_try_success": current_exchanges == 1 and current_clarifications == 0,
+                "correction_signaled": False,  # no following message to signal a correction
                 "timestamp": current_timestamp,
                 "tokens_estimate": total_tokens,
                 "tokens_per_exchange": tpe,
                 "user_tokens": current_user_tokens,
                 "assistant_tokens": current_assistant_tokens,
+                "session_model": current_model or fallback_model(),
             })
 
     # Session-level brain context check: startup hook_success entries arrive before the
@@ -373,12 +430,16 @@ def weekly_trend_analysis(entries):
         week_entries = weekly_buckets[week]
         avg_exchanges = sum(e["exchanges"] for e in week_entries) / len(week_entries)
         brain_usage = sum(1 for e in week_entries if e["brain_used"]) / len(week_entries) * 100
-        first_try = sum(1 for e in week_entries if e["first_try_success"]) / len(week_entries) * 100
-        
+        one_shot = sum(1 for e in week_entries if e["first_try_success"]) / len(week_entries) * 100
+        corr = [e for e in week_entries if "correction_signaled" in e]
+        clean_str = (f"{sum(1 for e in corr if not e['correction_signaled']) / len(corr) * 100:.0f}% clean"
+                     if corr else "clean n/a")
+
         print(f"  Week {week}: {len(week_entries)} tasks, "
               f"{avg_exchanges:.1f} avg exchanges, "
               f"{brain_usage:.0f}% brain usage, "
-              f"{first_try:.0f}% first-try success")
+              f"{clean_str}, "
+              f"{one_shot:.0f}% one-shot")
 
 
 def generate_report():
@@ -414,8 +475,12 @@ def generate_report():
             print(f"\n{label}: no data")
             return
         avg_exchanges = sum(e["exchanges"] for e in subset) / len(subset)
-        first_try_rate = sum(1 for e in subset if e["first_try_success"]) / len(subset) * 100
+        one_shot_rate = sum(1 for e in subset if e["first_try_success"]) / len(subset) * 100
         avg_clarifications = sum(e["clarifications_needed"] for e in subset) / len(subset)
+        # Difficulty-agnostic quality: tasks the user did NOT have to correct.
+        # Graceful for legacy records logged before correction tracking existed.
+        corr = [e for e in subset if "correction_signaled" in e]
+        clean_rate = (sum(1 for e in corr if not e["correction_signaled"]) / len(corr) * 100) if corr else None
         
         # Token stats (graceful for old entries without token data)
         token_entries = [e for e in subset if e.get("tokens_estimate")]
@@ -424,7 +489,9 @@ def generate_report():
         
         print(f"\n{label} (n={len(subset)}):")
         print(f"  Avg exchanges/task:    {avg_exchanges:.1f}")
-        print(f"  First-try success:     {first_try_rate:.0f}%")
+        if clean_rate is not None:
+            print(f"  Clean completion:      {clean_rate:.0f}%  (no user correction — the quality signal)")
+        print(f"  One-shot rate:         {one_shot_rate:.0f}%  (1 exchange — task complexity, NOT quality)")
         print(f"  Avg clarifications:    {avg_clarifications:.1f}")
         if token_entries:
             print(f"  Avg tokens/task:       {avg_tokens:,.0f}")
@@ -435,6 +502,16 @@ def generate_report():
     stats(recent, "Overall")
     stats(with_brain, "With brain context")
     stats(without_brain, "Without brain context")
+
+    # Per-model breakdown (the "better models use tools better" comparison).
+    by_model = defaultdict(list)
+    for e in recent:
+        by_model[e.get("session_model") or "unknown"].append(e)
+    if len(by_model) > 1:
+        print(f"\n=== By Model ===")
+        for model, subset in sorted(by_model.items(), key=lambda kv: -len(kv[1])):
+            brain_rate = sum(1 for e in subset if e["brain_used"]) / len(subset) * 100
+            stats(subset, f"{model} (brain used {brain_rate:.0f}%)")
 
     # Delta
     if with_brain and without_brain:
@@ -545,6 +622,8 @@ def load_from_jsonl(jsonl_path):
                     "role": role,
                     "content": msg.get("content", ""),
                     "timestamp": entry.get("timestamp", ""),
+                    # Claude Code JSONL stamps the model on each assistant message.
+                    "model": msg.get("model"),
                 })
     return messages
 
