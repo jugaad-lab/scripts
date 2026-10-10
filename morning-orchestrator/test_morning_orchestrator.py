@@ -166,6 +166,17 @@ class TestAccounts:
                 orch.get_calendar_account()
 
 
+class TestCollectEmails:
+    """Verify email-scan failures are recorded, not swallowed."""
+
+    @patch.dict(os.environ, {"GMAIL_ACCOUNTS": "test1@gmail.com"})
+    def test_search_failure_recorded_not_fatal(self):
+        with patch.object(orch, "run_command", return_value=MagicMock(returncode=1, stdout="", stderr="boom")):
+            result = orch.collect_emails()
+        assert result["total"] == 0
+        assert result["errors"] == ["test1@gmail.com: search failed (exit 1)"]
+
+
 class TestBlogPipeline:
     """Test blog pipeline file check."""
 

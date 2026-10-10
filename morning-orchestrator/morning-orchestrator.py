@@ -149,7 +149,8 @@ def collect_emails() -> dict:
     all_emails = []
     important = []
     noise_count = 0
-    
+    errors = []
+
     accounts = get_accounts()
     important_senders = get_important_senders()
 
@@ -161,6 +162,7 @@ def collect_emails() -> dict:
         )
         if result.returncode != 0:
             print(f"   ⚠️  {account}: search failed", file=sys.stderr)
+            errors.append(f"{account}: search failed (exit {result.returncode})")
             continue
 
         try:
@@ -200,6 +202,7 @@ def collect_emails() -> dict:
         "important": important,
         "important_count": len(important),
         "noise_count": noise_count,
+        "errors": errors,
     }
 
 
@@ -431,14 +434,14 @@ def main():
             return fn()
         except Exception as e:
             print(f"   ⚠️  {name} failed: {e}", file=sys.stderr)
-            return fallback
+            return {**fallback, "collector_error": str(e)}
 
     data = {
         "timestamp": timestamp,
         "day": day_name,
         "promos": safe_collect("promo cleanup", collect_promo_cleanup, {"total": 0, "accounts": {}}),
         "discord": safe_collect("discord digest", lambda: collect_discord_digest(hours=24), {"total_messages": 0, "total_mentions": 0, "unanswered_mentions": [], "active_channels": []}),
-        "emails": safe_collect("email scan", collect_emails, {"total": 0, "important": [], "important_count": 0, "noise_count": 0}),
+        "emails": safe_collect("email scan", collect_emails, {"total": 0, "important": [], "important_count": 0, "noise_count": 0, "errors": []}),
         "calendar": safe_collect("calendar check", collect_calendar, {"events": [], "today_count": 0, "tomorrow_count": 0}),
         "blog_pipeline": safe_collect("blog pipeline", collect_blog_pipeline, {"exists": False}),
         "todos": safe_collect("todos", collect_todos, {"exists": False, "pending_count": 0}),
