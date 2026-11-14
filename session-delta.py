@@ -88,6 +88,12 @@ def iter_entries(project_dir: Path, cutoff: str):
                         continue
                     if entry.get("type") not in ("user", "assistant"):
                         continue
+                    # Headless `claude -p` runs (cron jobs) share this project
+                    # dir with the live session. Their output is ours echoed
+                    # back, and extracting it fed noise into core memory, so
+                    # skip the whole transcript.
+                    if entry.get("entrypoint") == "sdk-cli":
+                        break
                     ts = entry.get("timestamp")
                     if not ts or ts <= cutoff:
                         continue
@@ -118,7 +124,9 @@ def main() -> int:
 
     emitted = 0
     newest = cutoff
-    for ts, kind, text in iter_entries(project_dir, cutoff):
+    # Sort before capping: files are walked in uuid order, so breaking early
+    # on raw order could advance the watermark past entries never emitted.
+    for ts, kind, text in sorted(iter_entries(project_dir, cutoff), key=lambda e: e[0]):
         if emitted >= args.max_entries:
             break
         role = "USER" if kind == "user" else "ASSISTANT"
