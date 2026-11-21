@@ -23,7 +23,9 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import re
+from zoneinfo import ZoneInfo
 
 # --- Config ---
 
@@ -51,26 +53,134 @@ def get_gog_env():
         sys.exit(1)
     return {**os.environ, "GOG_KEYRING_PASSWORD": os.environ["GOG_KEYRING_PASSWORD"]}
 
-def get_important_senders():
-    """Get important senders from environment variable."""
-    # Default important sender patterns
-    defaults = [
-        "chase", "wellsfargo", "bankofamerica", "citi", "amex", "apple card",
-        "google security", "security-noreply@google", "no-reply@accounts.google",
-        "anthropic", "meta", "facebook",
-        "irs.gov", "ssa.gov",
-    ]
-    
-    # Add custom senders from environment
-    custom_str = os.environ.get("IMPORTANT_SENDERS", "")
-    if custom_str.strip():
-        custom_senders = [sender.strip() for sender in custom_str.split(",") if sender.strip()]
-        defaults.extend(custom_senders)
-    
-    return defaults
-
-# Gmail categories considered noise (won't trigger agent)
+# Gmail categories that are ALWAYS noise
 NOISE_CATEGORIES = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
+
+# Sender patterns that are noise even if Gmail doesn't categorize them.
+# Unknown senders default to IMPORTANT — only add here if confirmed noise.
+# Subject patterns that indicate a bill/payment — no sender filtering needed.
+# Bills identify themselves by subject line.
+BILL_SUBJECT_PATTERNS = [
+    r"bill is ready", r"bill available", r"bill is available",
+    r"new bill", r"your .* bill",
+    r"payment due", r"payment is due", r"amount due", r"balance due",
+    r"pay your", r"payment reminder", r"upcoming payment",
+    r"scheduled payment", r"payment.* scheduled", r"autopay", r"auto.pay",
+    r"new statement", r"statement is ready", r"statement available",
+    r"your statement", r"monthly statement",
+    r"invoice", r"amount owed",
+    r"due date", r"due on \d",
+    r"\$[\d,]+\.?\d*\s*due",  # "$102.61 due"
+]
+
+# Subject patterns that indicate appointments / reminders
+APPOINTMENT_SUBJECT_PATTERNS = [
+    r"appointment", r"your visit", r"reminder.*appointment",
+    r"upcoming visit", r"check.?up", r"check-in",
+    r"reservation", r"booking confirm",
+    r"your (?:appointment|visit|reservation) is scheduled",
+    r"your (?:appointment|visit|reservation) is confirmed",
+    r"appointment on \w+", r"see you on",
+    r"dental", r"dentist", r"doctor", r"physician", r"clinic",
+    r"veterinar", r"vet visit", r"grooming",
+    r"service reminder", r"maintenance", r"oil change",
+    r"car service", r"vehicle service",
+    r"haircut", r"salon", r"barber",
+]
+
+# Subject/sender patterns for topics Raj cares about
+# Sourced from cashew brain — update when interests evolve
+INTEREST_PATTERNS = [
+    # Coffee
+    r"coffee", r"espresso", r"roast", r"cafe", r"barista", r"latte",
+    # Music (core identity — guitar, drums, production)
+    r"guitar", r"drum", r"music", r"concert", r"live show", r"album",
+    r"ableton", r"production", r"synth", r"pedal", r"midi",
+    r"band", r"musician", r"songwrit",
+    # Health & fitness (gym, nutrition, PCOS-friendly for Harika)
+    r"workout", r"fitness", r"health", r"nutrition", r"supplement",
+    r"sleep", r"wellness", r"pcos", r"meal plan", r"protein",
+    r"gym", r"strength", r"training",
+    # Puppy / dog
+    r"puppy", r"dog train", r"pet", r"chiki",
+    # Technology (AI, open source, agents)
+    r"open.?source", r"self.?host", r"raspberry pi", r"home.?lab",
+    r"llm", r"ai agent", r"anthropic", r"openai", r"claude",
+    r"machine learn", r"neural", r"embeddings",
+]
+
+# Patterns indicating personal outreach (real humans reaching out)
+PERSONAL_OUTREACH_PATTERNS = [
+    # Subject patterns
+    r"^re:", r"^hey ", r"^hi ", r"^hello",
+    r"catch up", r"catching up", r"let'?s connect", r"quick question",
+    r"reaching out", r"wanted to reach out", r"following up",
+    r"chat\??$", r"raj,?\s*chat", r"coffee\??$",
+    r"long time", r"how are you", r"how'?s it going",
+    r"missed you", r"checking in",
+]
+
+# Recruiter detection — sender and subject patterns
+RECRUITER_SENDER_PATTERNS = [
+    r"recruit", r"talent", r"hiring", r"sourcing",
+    r"inmail.*linkedin", r"linkedin\.com",  # LinkedIn InMail AND notifications about jobs
+    r"lever\.co", r"greenhouse",
+    r"ashbyhq", r"smartrecruiters", r"icims", r"workday",
+    r"hired\.com", r"triplebyte", r"turing\.com",
+]
+
+# LinkedIn senders that are NOT recruiter signals (digests, social updates)
+LINKEDIN_NOISE_SUBJECTS = [
+    r"share.* thoughts", r"endorsed you", r"congratulat",
+    r"trending", r"digest", r"people you may know",
+    r"new post", r"commented on", r"reacted to",
+    r"recently posted", r"posted a", r"published a",
+    r"happy (work|birth)day", r"anniversary",
+    r"announces", r"new article", r"in the news",
+    r"take control", r"career tips", r"career in the",
+    r"jobs? you might", r"recommended for you",
+]
+
+RECRUITER_SUBJECT_PATTERNS = [
+    r"opportunity", r"role at", r"position at", r"job opening",
+    r"developer opportunity", r"engineer opportunity",
+    r"we'?re hiring", r"join .* team", r"interested in",
+    r"your profile", r"your background", r"your experience",
+    r"full.?stack", r"senior engineer", r"staff engineer",
+    r"exciting opportunity", r"career opportunity",
+    r"new job:", r"job alert",  # LinkedIn job notifications
+    # Indirect recruiter pitches (hedge funds, trading firms, stealth startups)
+    r"hedge fund", r"trading firm", r"quant", r"prop trading",
+    r"great fit", r"perfect fit", r"your skills",
+    r"confidential.*role", r"stealth", r"pre.?launch",
+]
+
+# Sender patterns that indicate automated/noreply (NOT personal outreach)
+AUTOMATED_SENDER_PATTERNS = [
+    r"noreply", r"no-reply", r"no_reply", r"donotreply",
+    r"notifications?@", r"alerts?@", r"updates?@",
+    r"newsletter", r"marketing@", r"promo",
+    r"support@", r"billing@", r"info@",
+    r"mailer-daemon", r"postmaster",
+    r"marketplace.*amazon", r"shipment-tracking",
+    r"account-update", r"security-alert",
+    r"feedback@", r"survey@", r"rate.your",
+]
+
+NOISE_SENDERS = [
+    # Digests / newsletters
+    "quora", "digest@", "newsletters@", "noreply@marketing",
+    # Marketing disguised as updates
+    "starbucks", "avis", "hertz", "enterprise",
+    "amazon business", "no-reply@business.amazon",
+    "robinhood", "snacks.robinhood",
+    "redfin", "zillow", "realtor.com",
+    "bayclubs", "crunch fitness", "lifetime fitness",
+    "doordash", "ubereats", "grubhub",
+    "spotify", "netflix", "hulu", "youtube",
+    "linkedin", "indeed", "glassdoor",
+    "cleartax",
+]
 
 
 # --- Helpers ---
@@ -143,15 +253,154 @@ def collect_discord_digest(hours: int = 24) -> dict:
     return result or {"total_messages": 0, "total_mentions": 0, "unanswered_mentions": [], "active_channels": []}
 
 
+def _classify_email(subject: str, sender: str) -> dict:
+    """Classify an email by subject/sender patterns. Returns tag dict."""
+    subj_lower = subject.lower()
+    sender_lower = sender.lower()
+    combined = f"{subj_lower} {sender_lower}"
+    tags = {}
+
+    if any(re.search(p, subj_lower) for p in BILL_SUBJECT_PATTERNS):
+        tags["bill"] = True
+    if any(re.search(p, subj_lower) for p in APPOINTMENT_SUBJECT_PATTERNS):
+        tags["appointment"] = True
+    if any(re.search(p, combined) for p in INTEREST_PATTERNS):
+        tags["interest"] = True
+
+    # Recruiter detection (sender OR subject match)
+    is_recruiter_sender = any(re.search(p, sender_lower) for p in RECRUITER_SENDER_PATTERNS)
+    is_recruiter_subject = any(re.search(p, subj_lower) for p in RECRUITER_SUBJECT_PATTERNS)
+
+    # LinkedIn special handling: sender matches but check if it's just a social digest
+    if is_recruiter_sender and "linkedin" in sender_lower:
+        is_linkedin_noise = any(re.search(p, subj_lower) for p in LINKEDIN_NOISE_SUBJECTS)
+        if is_linkedin_noise:
+            is_recruiter_sender = False
+
+    if is_recruiter_sender or is_recruiter_subject:
+        tags["recruiter"] = True
+
+    # Personal outreach — subject looks personal AND sender is NOT automated
+    is_automated = any(re.search(p, sender_lower) for p in AUTOMATED_SENDER_PATTERNS)
+    if not is_automated and not tags:
+        # Only check for personal outreach if not already tagged as something else
+        if any(re.search(p, subj_lower) for p in PERSONAL_OUTREACH_PATTERNS):
+            tags["personal_outreach"] = True
+
+    return tags
+
+
+def _get_thread_snippet(thread_id: str, account: str) -> str:
+    """Fetch the snippet (preview text) for a thread. Lightweight — no full body decode."""
+    result = run_command(
+        ["gog", "gmail", "thread", "get", thread_id,
+         "--account", account, "--json", "--no-input"],
+        env=get_gog_env(), timeout=15, retries=1,
+    )
+    if result.returncode != 0:
+        return ""
+    try:
+        data = json.loads(result.stdout)
+        messages = data.get("thread", {}).get("messages", [])
+        # Combine snippets from all messages in thread (most recent last)
+        snippets = [m.get("snippet", "") for m in messages]
+        return " ".join(snippets)[:500]
+    except (json.JSONDecodeError, KeyError):
+        return ""
+
+
+# Body/snippet patterns for recruiter detection (second pass)
+RECRUITER_BODY_PATTERNS = [
+    r"recruit", r"hiring", r"talent",
+    r"role", r"position", r"opportunity",
+    r"great fit", r"perfect fit", r"strong fit",
+    r"your background", r"your experience", r"your profile",
+    r"job description", r"compensation", r"total comp",
+    r"interview", r"screening", r"phone screen",
+    r"engineering team", r"join our",
+    r"resume", r"cv",
+    r"trading firm", r"hedge fund", r"quant",
+    r"series [a-d]", r"funded", r"startup",
+]
+
+# Body/snippet patterns for personal outreach (second pass)
+PERSONAL_BODY_PATTERNS = [
+    r"^hi raj", r"^hey raj", r"^hello raj",
+    r"wanted to connect", r"wanted to reach out",
+    r"let me know", r"would love to chat",
+    r"catch up", r"coffee", r"meet up",
+    r"how are you", r"how have you been",
+    r"long time", r"been a while",
+]
+
+# Body/snippet patterns for appointments (second pass)
+APPOINTMENT_BODY_PATTERNS = [
+    r"appointment", r"scheduled for", r"your visit",
+    r"please arrive", r"check.?in",
+    r"reservation", r"booking",
+    r"\d{1,2}:\d{2}\s*(am|pm)", # time mentions
+]
+
+# Body/snippet patterns for bills (second pass)
+BILL_BODY_PATTERNS = [
+    r"amount due", r"balance due", r"payment due",
+    r"due date", r"pay by", r"autopay",
+    r"bill is ready", r"statement",
+    r"\$\d+\.?\d*\s*(due|owed|balance)",
+]
+
+
+def _classify_from_snippet(snippet: str) -> dict:
+    """Second-pass classification using email body snippet."""
+    snippet_lower = snippet.lower()
+    tags = {}
+
+    # Count recruiter signal matches — require 2+ to reduce false positives
+    recruiter_hits = sum(1 for p in RECRUITER_BODY_PATTERNS if re.search(p, snippet_lower))
+    if recruiter_hits >= 2:
+        tags["recruiter"] = True
+
+    # Require 2+ personal outreach signals to reduce false positives
+    personal_hits = sum(1 for p in PERSONAL_BODY_PATTERNS if re.search(p, snippet_lower))
+    if personal_hits >= 2:
+        tags["personal_outreach"] = True
+
+    if any(re.search(p, snippet_lower) for p in APPOINTMENT_BODY_PATTERNS):
+        tags["appointment"] = True
+
+    if any(re.search(p, snippet_lower) for p in BILL_BODY_PATTERNS):
+        tags["bill"] = True
+
+    return tags
+
+
+def _mark_as_read(thread_ids_by_account: dict) -> None:
+    """Mark surfaced email threads as read so Raj doesn't see them as unread."""
+    env = get_gog_env()
+    for account, thread_ids in thread_ids_by_account.items():
+        if not thread_ids:
+            continue
+        for tid in thread_ids:
+            result = run_command(
+                ["gog", "gmail", "thread", "modify", tid,
+                 "--remove", "UNREAD", "--account", account, "--force", "--no-input"],
+                env=env, timeout=15, retries=1,
+            )
+            if result.returncode != 0:
+                print(f"   ⚠️  Failed to mark {tid} as read in {account}", file=sys.stderr)
+        print(f"   ✓ Marked {len(thread_ids)} threads as read in {account}")
+
+
 def collect_emails() -> dict:
     """Scan emails across all accounts, classify importance."""
     print("📬 Scanning emails...")
     all_emails = []
     important = []
     noise_count = 0
-    
+    surfaced_threads = {}  # account -> [thread_ids] for mark-as-read
+    scan_failures = []  # accounts whose search failed — scan is incomplete, NOT "inbox clear"
+
     accounts = get_accounts()
-    important_senders = get_important_senders()
 
     for account in accounts:
         result = run_command(
@@ -161,18 +410,22 @@ def collect_emails() -> dict:
         )
         if result.returncode != 0:
             print(f"   ⚠️  {account}: search failed", file=sys.stderr)
+            scan_failures.append({"account": account, "stage": "search", "error": result.stderr[:300]})
             continue
 
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError:
+            scan_failures.append({"account": account, "stage": "parse", "error": "invalid JSON from gog search"})
             continue
 
+        surfaced_threads[account] = []
         threads = data.get("threads", [])
         for thread in threads:
             labels = set(thread.get("labels", []))
             sender = thread.get("from", "").lower()
             subject = thread.get("subject", "")
+            thread_id = thread.get("id", "")
 
             email_entry = {
                 "account": account,
@@ -180,19 +433,144 @@ def collect_emails() -> dict:
                 "subject": subject,
                 "date": thread.get("date", ""),
                 "labels": list(labels),
+                "thread_id": thread_id,
             }
 
-            # Classify: is this important?
-            is_noise = bool(labels & NOISE_CATEGORIES)
-            is_important_sender = any(s in sender for s in important_senders)
+            # Classify by subject/sender patterns
+            tags = _classify_email(subject, sender)
+            email_entry.update(tags)
 
-            if is_important_sender or (not is_noise and "INBOX" in labels):
+            # Bills, appointments, and interests are ALWAYS important
+            # even if Gmail categorized them as promos/social/forums
+            is_tagged = bool(tags)
+
+            # Classify: noise if in noise category OR from noise sender.
+            # Everything else defaults to important (unknown senders = important).
+            is_noise = bool(labels & NOISE_CATEGORIES) or any(s in sender for s in NOISE_SENDERS)
+
+            if is_tagged:
                 email_entry["important"] = True
                 important.append(email_entry)
+                surfaced_threads[account].append(thread_id)
+            elif is_noise:
+                noise_count += 1
+            elif "INBOX" in labels:
+                email_entry["important"] = True
+                important.append(email_entry)
+                surfaced_threads[account].append(thread_id)
             else:
                 noise_count += 1
 
             all_emails.append(email_entry)
+
+    # Recruiter deep scan: check older unread emails for recruiter/personal outreach
+    # This catches emails that arrived days ago but weren't seen
+    print(f"   🎯 Recruiter deep scan (7 days, unread only)...")
+    for account in accounts:
+        result = run_command(
+            ["gog", "gmail", "search", "is:unread newer_than:7d -category:promotions -category:social -category:forums",
+             "--max", "15", "--account", account, "--json", "--no-input"],
+            env=get_gog_env(), timeout=30,
+        )
+        if result.returncode != 0:
+            continue
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            continue
+
+        for thread in data.get("threads", []):
+            thread_id = thread.get("id", "")
+            # Skip if already processed in the 1-day scan
+            if any(e.get("thread_id") == thread_id for e in all_emails):
+                continue
+
+            sender = thread.get("from", "").lower()
+            subject = thread.get("subject", "")
+            tags = _classify_email(subject, sender)
+
+            if tags.get("recruiter") or tags.get("personal_outreach"):
+                email_entry = {
+                    "account": account,
+                    "from": thread.get("from", ""),
+                    "subject": subject,
+                    "date": thread.get("date", ""),
+                    "labels": thread.get("labels", []),
+                    "thread_id": thread_id,
+                    "important": True,
+                    "classified_by": "recruiter_deep_scan",
+                    **tags,
+                }
+                important.append(email_entry)
+                surfaced_threads.setdefault(account, []).append(thread_id)
+                print(f"      ✓ Deep scan: {subject[:60]} → {list(tags.keys())}")
+
+            # If not classified by subject, check snippet for recruiter signals
+            elif not any(re.search(p, sender.lower()) for p in AUTOMATED_SENDER_PATTERNS):
+                try:
+                    snippet = _get_thread_snippet(thread_id, account)
+                    if snippet:
+                        body_tags = _classify_from_snippet(snippet)
+                        if body_tags.get("recruiter") or body_tags.get("personal_outreach"):
+                            email_entry = {
+                                "account": account,
+                                "from": thread.get("from", ""),
+                                "subject": subject,
+                                "date": thread.get("date", ""),
+                                "labels": thread.get("labels", []),
+                                "thread_id": thread_id,
+                                "important": True,
+                                "classified_by": "recruiter_deep_scan_body",
+                                "snippet_preview": snippet[:200],
+                                **body_tags,
+                            }
+                            important.append(email_entry)
+                            surfaced_threads.setdefault(account, []).append(thread_id)
+                            print(f"      ✓ Deep scan (body): {subject[:60]} → {list(body_tags.keys())}")
+                except Exception as e:
+                    print(f"      ⚠️  Snippet fetch failed for {thread_id}: {e}", file=sys.stderr)
+
+    # Second pass: for unclassified emails from non-automated senders,
+    # fetch the snippet and try to classify from the body preview.
+    # This catches recruiter emails with weird subject lines, personal outreach, etc.
+    unclassified = [
+        e for e in all_emails
+        if not e.get("important")
+        and e.get("thread_id")
+        and not any(re.search(p, e.get("from", "").lower()) for p in AUTOMATED_SENDER_PATTERNS)
+        and "INBOX" in set(e.get("labels", []))
+    ]
+
+    if unclassified:
+        print(f"   🔍 Second pass: scanning {len(unclassified)} unclassified emails...")
+        for email_entry in unclassified:
+            try:
+                snippet = _get_thread_snippet(email_entry["thread_id"], email_entry["account"])
+                if not snippet:
+                    continue
+                body_tags = _classify_from_snippet(snippet)
+                if body_tags:
+                    email_entry.update(body_tags)
+                    email_entry["important"] = True
+                    email_entry["classified_by"] = "body_scan"
+                    email_entry["snippet_preview"] = snippet[:200]
+                    important.append(email_entry)
+                    surfaced_threads.setdefault(email_entry["account"], []).append(email_entry["thread_id"])
+                    noise_count -= 1  # was counted as noise in first pass
+                    print(f"      ✓ Caught: {email_entry['subject'][:60]} → {list(body_tags.keys())}")
+            except Exception as e:
+                print(f"      ⚠️  Snippet fetch failed: {e}", file=sys.stderr)
+
+    # Mark all surfaced emails as read. Non-fatal: a gog failure here must not
+    # take down the whole email-scan step (and must not be swallowed either).
+    total_surfaced = sum(len(ids) for ids in surfaced_threads.values())
+    if total_surfaced > 0:
+        print(f"   📖 Marking {total_surfaced} surfaced emails as read...")
+        try:
+            _mark_as_read(surfaced_threads)
+        except Exception as e:
+            print(f"   ⚠️  Mark-as-read failed: {e}", file=sys.stderr)
+            scan_failures.append({"account": "all", "stage": "mark_as_read", "error": str(e)})
 
     print(f"   {len(important)} important, {noise_count} noise across {len(accounts)} accounts")
     return {
@@ -200,7 +578,35 @@ def collect_emails() -> dict:
         "important": important,
         "important_count": len(important),
         "noise_count": noise_count,
+        "scan_failed": bool(scan_failures),
+        "scan_failures": scan_failures,
     }
+
+
+def _to_pacific(dt_str: str, tz=None) -> str:
+    """Convert an ISO datetime string to Pacific Time display format."""
+    if not dt_str:
+        return dt_str
+    if tz is None:
+        tz = ZoneInfo("America/Los_Angeles")
+    try:
+        # All-day events are just dates — return as-is
+        if len(dt_str) <= 10:
+            return dt_str
+        # Try parsing with timezone info (e.g. 2026-03-09T10:00:00Z or +00:00)
+        dt_str_clean = dt_str.replace("Z", "+00:00")
+        from datetime import datetime as _dt
+        dt = _dt.fromisoformat(dt_str_clean)
+        if dt.tzinfo is None:
+            # Assume UTC if no timezone
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_pacific = dt.astimezone(tz)
+        return dt_pacific.strftime("%Y-%m-%dT%H:%M:%S %Z")
+    except (ValueError, TypeError):
+        return dt_str
+
+
+FAMILY_CALENDAR_ID = "family15086022744551263232@group.calendar.google.com"
 
 
 def collect_calendar() -> dict:
@@ -209,36 +615,41 @@ def collect_calendar() -> dict:
     today = datetime.now().strftime("%Y-%m-%dT00:00:00")
     day_after = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00")
 
-    result = run_command(
-        ["gog", "calendar", "events", "primary", "--from", today, "--to", day_after,
-         "--account", get_calendar_account(), "--json", "--no-input"],
-        env=get_gog_env(),
-        timeout=30,
-    )
-
-    if result.returncode != 0:
-        print(f"   ⚠️  Calendar check failed", file=sys.stderr)
-        return {"events": [], "today_count": 0, "tomorrow_count": 0}
-
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {"events": [], "today_count": 0, "tomorrow_count": 0}
-
-    events = data.get("events", [])
+    # Shared events (appointments, birthdays, trips) live on the Family
+    # calendar Raj shares with Harika, so read it alongside primary.
+    events = []
+    for cal in ("primary", FAMILY_CALENDAR_ID):
+        result = run_command(
+            ["gog", "calendar", "events", cal, "--from", today, "--to", day_after,
+             "--account", get_calendar_account(), "--json", "--no-input"],
+            env=get_gog_env(),
+            timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"   ⚠️  Calendar check failed for {cal}", file=sys.stderr)
+            continue
+        try:
+            events.extend(json.loads(result.stdout).get("events", []))
+        except json.JSONDecodeError:
+            continue
     today_str = datetime.now().strftime("%Y-%m-%d")
     tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    today_events = [e for e in events if today_str in e.get("start", "")]
-    tomorrow_events = [e for e in events if tomorrow_str in e.get("start", "")]
+    # Convert start times to Pacific BEFORE comparing dates — an event with a
+    # non-Pacific offset can have a different calendar date in its raw start
+    # string than its actual Pacific-local date, so matching the raw string
+    # silently misses it.
+    pacific = ZoneInfo("America/Los_Angeles")
+    today_events = [e for e in events if today_str in _to_pacific(e.get("start", ""), pacific)]
+    tomorrow_events = [e for e in events if tomorrow_str in _to_pacific(e.get("start", ""), pacific)]
 
-    # Simplify event data
+    # Simplify event data, converting times to Pacific
     simplified = []
     for e in events:
         simplified.append({
             "summary": e.get("summary", "No title"),
-            "start": e.get("start", ""),
-            "end": e.get("end", ""),
+            "start": _to_pacific(e.get("start", ""), pacific),
+            "end": _to_pacific(e.get("end", ""), pacific),
             "status": e.get("status", ""),
         })
 
@@ -252,7 +663,7 @@ def collect_calendar() -> dict:
 
 # --- Workspace File Checks (zero-cost, filesystem only) ---
 
-WORKSPACE_DIR = os.path.join(os.path.dirname(SCRIPTS_DIR), "memory")
+WORKSPACE_DIR = os.path.dirname(SCRIPTS_DIR)
 
 def collect_cost_tracker() -> dict:
     """Run cost tracker and return results. Filesystem only, zero API calls."""
@@ -299,71 +710,52 @@ def collect_cost_tracker() -> dict:
 
 
 def collect_blog_pipeline() -> dict:
-    """Check blog pipeline status from file metadata + content. Zero API calls."""
+    """Check blog pipeline status from cashew brain."""
     print("📝 Checking blog pipeline...")
-    pipeline_path = os.path.join(WORKSPACE_DIR, "blog-pipeline.md")
-
-    if not os.path.exists(pipeline_path):
-        print("   No pipeline file found")
+    cashew_dir = os.path.join(WORKSPACE_DIR, "cashew")
+    try:
+        env = os.environ.copy()
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        result = subprocess.run(
+            ["python3", "scripts/cashew_context.py", "context", "--hints", "blog pipeline active draft status shipping"],
+            capture_output=True, text=True, timeout=30, cwd=cashew_dir, env=env
+        )
+        output = result.stdout.strip()
+        # Extract relevant lines from brain output
+        blog_lines = [l.strip() for l in output.split("\n") if any(kw in l.lower() for kw in ["blog", "draft", "ship"])]
+        if blog_lines:
+            print(f"   {len(blog_lines)} blog-related nodes found")
+            return {"exists": True, "brain_context": blog_lines[:10]}
+        else:
+            print("   No active blog items in brain")
+            return {"exists": False}
+    except Exception as e:
+        print(f"   Brain query failed: {e}")
         return {"exists": False}
-
-    mtime = os.path.getmtime(pipeline_path)
-    days_since_modified = (time.time() - mtime) / 86400
-
-    # Parse active blogs (lines matching "Stage:" that aren't SHIPPED or SEED)
-    active_blogs = []
-    current_blog = None
-    with open(pipeline_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("## Blog") and ":" in line:
-                current_blog = line.split(":", 1)[1].strip().strip('"')
-            if "**Stage:**" in line and current_blog:
-                stage = line.split("**Stage:**")[1].strip()
-                if "SHIPPED" not in stage and "SEED" not in stage:
-                    active_blogs.append({"title": current_blog, "stage": stage})
-                current_blog = None
-
-    result = {
-        "exists": True,
-        "days_since_modified": round(days_since_modified, 1),
-        "active_blogs": active_blogs,
-    }
-    print(f"   {len(active_blogs)} active blog(s), last modified {days_since_modified:.0f}d ago")
-    return result
 
 
 def collect_todos() -> dict:
-    """Check todos file for pending items. Zero API calls."""
+    """Check pending items from cashew brain."""
     print("✅ Checking todos...")
-    todos_path = os.path.join(WORKSPACE_DIR, "todos.md")
-
-    if not os.path.exists(todos_path):
-        print("   No todos file found")
+    cashew_dir = os.path.join(WORKSPACE_DIR, "cashew")
+    try:
+        env = os.environ.copy()
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        result = subprocess.run(
+            ["python3", "scripts/cashew_context.py", "context", "--hints", "pending todo action items open tasks deadlines"],
+            capture_output=True, text=True, timeout=30, cwd=cashew_dir, env=env
+        )
+        output = result.stdout.strip()
+        todo_lines = [l.strip() for l in output.split("\n") if any(kw in l.lower() for kw in ["todo", "pending", "deadline", "action", "task", "need to"])]
+        if todo_lines:
+            print(f"   {len(todo_lines)} pending items found")
+            return {"exists": True, "pending_count": len(todo_lines), "brain_context": todo_lines[:10]}
+        else:
+            print("   No pending items in brain")
+            return {"exists": False, "pending_count": 0}
+    except Exception as e:
+        print(f"   Brain query failed: {e}")
         return {"exists": False, "pending_count": 0}
-
-    pending = []
-    in_pending = False
-    current_item = None
-    with open(todos_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line == "## Pending":
-                in_pending = True
-                continue
-            if line.startswith("## ") and in_pending:
-                break  # hit next section
-            if in_pending and line.startswith("### "):
-                current_item = line[4:].strip()
-                pending.append(current_item)
-
-    result = {
-        "exists": True,
-        "pending_count": len(pending),
-        "pending_items": pending,
-    }
-    print(f"   {len(pending)} pending todo(s)")
-    return result
 
 
 # --- Actionability Check ---
@@ -371,6 +763,37 @@ def collect_todos() -> dict:
 def is_actionable(data: dict) -> tuple[bool, list[str]]:
     """Determine if any data warrants waking an agent. Returns (bool, reasons)."""
     reasons = []
+
+    # Email scan failures — surface explicitly so the briefing doesn't imply
+    # a clean inbox when the scan actually failed partway through.
+    if data["emails"].get("scan_failed"):
+        failed_accounts = ", ".join(f.get("account", "?") for f in data["emails"].get("scan_failures", []))
+        reasons.append(f"⚠️ email scan failed for: {failed_accounts}")
+
+    # Bills / financial emails (high priority)
+    bills = [e for e in data["emails"].get("important", []) if e.get("bill")]
+    if bills:
+        reasons.append(f"💰 {len(bills)} bill(s) due — needs attention")
+
+    # Appointments
+    appts = [e for e in data["emails"].get("important", []) if e.get("appointment")]
+    if appts:
+        reasons.append(f"📋 {len(appts)} appointment reminder(s)")
+
+    # Recruiter emails (high priority — Raj wants to be proactive)
+    recruiters = [e for e in data["emails"].get("important", []) if e.get("recruiter")]
+    if recruiters:
+        reasons.append(f"🎯 {len(recruiters)} recruiter outreach(es) — needs review")
+
+    # Personal outreach
+    outreach = [e for e in data["emails"].get("important", []) if e.get("personal_outreach")]
+    if outreach:
+        reasons.append(f"👋 {len(outreach)} personal outreach(es)")
+
+    # Interest-based emails
+    interests = [e for e in data["emails"].get("important", []) if e.get("interest")]
+    if interests:
+        reasons.append(f"⭐ {len(interests)} email(s) matching your interests")
 
     # Important emails
     if data["emails"]["important_count"] > 0:
@@ -392,10 +815,10 @@ def is_actionable(data: dict) -> tuple[bool, list[str]]:
         savings = costs.get("potential_savings", 0)
         reasons.append(f"API costs: ${costs.get('monthly_projection', '?')}/mo projected → {rec} (save ~${savings}/mo)")
 
-    # Blog pipeline — only flag if active blog hasn't been touched in 7+ days
+    # Blog pipeline — flag if brain has active blog items
     blog = data.get("blog_pipeline", {})
-    if blog.get("active_blogs") and blog.get("days_since_modified", 0) >= 7:
-        reasons.append(f"blog pipeline untouched for {blog['days_since_modified']:.0f} days")
+    if blog.get("exists") and blog.get("brain_context"):
+        reasons.append("active blog item(s) in brain")
 
     # Pending todos
     todos = data.get("todos", {})

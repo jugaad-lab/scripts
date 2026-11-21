@@ -104,26 +104,6 @@ class TestIsActionable:
         assert len(reasons) >= 3  # emails + calendar + mentions (+ possibly weekday)
 
 
-class TestImportantSenders:
-    """Verify sender classification config."""
-
-    def test_default_senders_not_empty(self):
-        senders = orch.get_important_senders()
-        assert len(senders) > 0
-
-    def test_financial_senders_included(self):
-        senders = orch.get_important_senders()
-        senders_str = " ".join(senders)
-        assert "chase" in senders_str
-        assert "google security" in senders_str
-
-    @patch.dict(os.environ, {"IMPORTANT_SENDERS": "custom1@example.com,custom2@example.com"})
-    def test_custom_senders_added(self):
-        senders = orch.get_important_senders()
-        assert "custom1@example.com" in senders
-        assert "custom2@example.com" in senders
-
-
 class TestNoiseCategories:
     """Verify noise classification."""
 
@@ -167,96 +147,72 @@ class TestAccounts:
 
 
 class TestBlogPipeline:
-    """Test blog pipeline file check."""
+    """Test blog pipeline brain query (collect_blog_pipeline queries cashew, not a local file)."""
 
-    def test_no_pipeline_file(self, tmp_path):
-        """Returns exists=False when file doesn't exist."""
-        original = orch.WORKSPACE_DIR
-        orch.WORKSPACE_DIR = str(tmp_path)
-        try:
+    def _mock_result(self, stdout, returncode=0):
+        mock = MagicMock()
+        mock.stdout = stdout
+        mock.returncode = returncode
+        return mock
+
+    def test_no_blog_context(self):
+        """Returns exists=False when brain has no blog-related nodes."""
+        with patch.object(orch.subprocess, "run", return_value=self._mock_result("no relevant nodes")):
             result = orch.collect_blog_pipeline()
             assert result["exists"] is False
-        finally:
-            orch.WORKSPACE_DIR = original
 
-    def test_parses_active_blogs(self, tmp_path):
-        """Correctly identifies active blogs (not SHIPPED, not SEED)."""
-        pipeline = tmp_path / "blog-pipeline.md"
-        pipeline.write_text(
-            '## Blog 1: "Architecture of Belief"\n'
-            '- **Stage:** SHIPPED ✅\n'
-            '\n'
-            '## Blog 2: "On Conviction"\n'
-            '- **Stage:** OUTLINE COMPLETE ✅ → Next: Marinate → Draft\n'
-            '\n'
-            '## Blog 3: "Unfalsifiable Systems"\n'
-            '- **Stage:** IDEA CAPTURED → Needs marinate + outline\n'
-            '\n'
-            '## Blog 4+: The Personal Journey\n'
-            '- **Stage:** SEED\n'
+    def test_parses_active_blogs(self):
+        """Surfaces blog-related brain context lines when present."""
+        stdout = (
+            "1. [fact] Active blog draft: 'On Conviction' is in DRAFT stage\n"
+            "2. [fact] Raj's work calendar shows 3 meetings today\n"
         )
-        original = orch.WORKSPACE_DIR
-        orch.WORKSPACE_DIR = str(tmp_path)
-        try:
+        with patch.object(orch.subprocess, "run", return_value=self._mock_result(stdout)):
             result = orch.collect_blog_pipeline()
             assert result["exists"] is True
-            assert len(result["active_blogs"]) == 2
-            titles = [b["title"] for b in result["active_blogs"]]
-            assert any("Conviction" in t for t in titles)
-            assert any("Unfalsifiable" in t for t in titles)
-        finally:
-            orch.WORKSPACE_DIR = original
+            assert any("blog" in l.lower() or "draft" in l.lower() for l in result["brain_context"])
 
-    def test_days_since_modified(self, tmp_path):
-        """Reports modification time correctly."""
-        pipeline = tmp_path / "blog-pipeline.md"
-        pipeline.write_text("## Blog 1: Test\n- **Stage:** SHIPPED\n")
-        original = orch.WORKSPACE_DIR
-        orch.WORKSPACE_DIR = str(tmp_path)
-        try:
+    def test_brain_query_failure(self):
+        """A brain query exception degrades to exists=False rather than raising."""
+        with patch.object(orch.subprocess, "run", side_effect=Exception("brain unreachable")):
             result = orch.collect_blog_pipeline()
-            assert result["days_since_modified"] < 1  # just created
-        finally:
-            orch.WORKSPACE_DIR = original
+            assert result["exists"] is False
 
 
 class TestTodos:
-    """Test todos file check."""
+    """Test todos brain query (collect_todos queries cashew, not a local file)."""
 
-    def test_no_todos_file(self, tmp_path):
-        """Returns exists=False when file doesn't exist."""
-        original = orch.WORKSPACE_DIR
-        orch.WORKSPACE_DIR = str(tmp_path)
-        try:
+    def _mock_result(self, stdout, returncode=0):
+        mock = MagicMock()
+        mock.stdout = stdout
+        mock.returncode = returncode
+        return mock
+
+    def test_no_todo_context(self):
+        """Returns exists=False and pending_count=0 when brain has no todo nodes."""
+        with patch.object(orch.subprocess, "run", return_value=self._mock_result("no relevant nodes")):
             result = orch.collect_todos()
             assert result["exists"] is False
             assert result["pending_count"] == 0
-        finally:
-            orch.WORKSPACE_DIR = original
 
-    def test_parses_pending_items(self, tmp_path):
-        """Correctly counts pending items."""
-        todos = tmp_path / "todos.md"
-        todos.write_text(
-            "# Bunny's TODOs\n\n"
-            "## Pending\n\n"
-            "### Cost tracking setup\n"
-            "- Details here\n\n"
-            "### Fix the widget\n"
-            "- More details\n\n"
-            "## Done\n\n"
-            "### Already done thing ✅\n"
+    def test_parses_pending_items(self):
+        """Counts brain context lines matching todo/pending keywords."""
+        stdout = (
+            "1. [commitment] TODO: fix the widget\n"
+            "2. [commitment] Pending action: cost tracking setup\n"
+            "3. [fact] Raj's work calendar shows 3 meetings today\n"
         )
-        original = orch.WORKSPACE_DIR
-        orch.WORKSPACE_DIR = str(tmp_path)
-        try:
+        with patch.object(orch.subprocess, "run", return_value=self._mock_result(stdout)):
             result = orch.collect_todos()
             assert result["exists"] is True
             assert result["pending_count"] == 2
-            assert "Cost tracking setup" in result["pending_items"]
-            assert "Fix the widget" in result["pending_items"]
-        finally:
-            orch.WORKSPACE_DIR = original
+
+    def test_brain_query_failure(self):
+        """A brain query exception degrades to exists=False/pending_count=0 rather than raising."""
+        with patch.object(orch.subprocess, "run", side_effect=Exception("brain unreachable")):
+            result = orch.collect_todos()
+            assert result["exists"] is False
+            assert result["pending_count"] == 0
 
     def test_empty_pending_section(self, tmp_path):
         """Returns 0 when pending section is empty."""
@@ -280,12 +236,12 @@ class TestActionabilityWithNewCollectors:
     """Test actionability triggers for blog pipeline and todos."""
 
     def test_stale_blog_triggers(self):
-        """Blog untouched for 7+ days should trigger."""
+        """Active blog item(s) in brain context should trigger."""
         data = {
             "emails": {"important_count": 0},
             "calendar": {"today_count": 0},
             "discord": {"unanswered_mentions": []},
-            "blog_pipeline": {"active_blogs": [{"title": "Test", "stage": "DRAFT"}], "days_since_modified": 8.0},
+            "blog_pipeline": {"exists": True, "brain_context": ["active blog draft: Test"]},
             "todos": {"pending_count": 0},
         }
         # Patch to weekend so weekday doesn't trigger
@@ -303,12 +259,12 @@ class TestActionabilityWithNewCollectors:
             orch.datetime = old_datetime
 
     def test_fresh_blog_no_trigger(self):
-        """Blog touched recently should NOT trigger."""
+        """No blog context in brain should NOT trigger."""
         data = {
             "emails": {"important_count": 0},
             "calendar": {"today_count": 0},
             "discord": {"unanswered_mentions": []},
-            "blog_pipeline": {"active_blogs": [{"title": "Test", "stage": "DRAFT"}], "days_since_modified": 2.0},
+            "blog_pipeline": {"exists": False},
             "todos": {"pending_count": 0},
         }
         old_datetime = orch.datetime
