@@ -606,29 +606,32 @@ def _to_pacific(dt_str: str, tz=None) -> str:
         return dt_str
 
 
+FAMILY_CALENDAR_ID = "family15086022744551263232@group.calendar.google.com"
+
+
 def collect_calendar() -> dict:
     """Check calendar for today and tomorrow."""
     print("📅 Checking calendar...")
     today = datetime.now().strftime("%Y-%m-%dT00:00:00")
     day_after = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00")
 
-    result = run_command(
-        ["gog", "calendar", "events", "primary", "--from", today, "--to", day_after,
-         "--account", get_calendar_account(), "--json", "--no-input"],
-        env=get_gog_env(),
-        timeout=30,
-    )
-
-    if result.returncode != 0:
-        print(f"   ⚠️  Calendar check failed", file=sys.stderr)
-        return {"events": [], "today_count": 0, "tomorrow_count": 0}
-
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {"events": [], "today_count": 0, "tomorrow_count": 0}
-
-    events = data.get("events", [])
+    # Shared events (appointments, birthdays, trips) live on the Family
+    # calendar Raj shares with Harika, so read it alongside primary.
+    events = []
+    for cal in ("primary", FAMILY_CALENDAR_ID):
+        result = run_command(
+            ["gog", "calendar", "events", cal, "--from", today, "--to", day_after,
+             "--account", get_calendar_account(), "--json", "--no-input"],
+            env=get_gog_env(),
+            timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"   ⚠️  Calendar check failed for {cal}", file=sys.stderr)
+            continue
+        try:
+            events.extend(json.loads(result.stdout).get("events", []))
+        except json.JSONDecodeError:
+            continue
     today_str = datetime.now().strftime("%Y-%m-%d")
     tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
